@@ -2,85 +2,207 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define MAX_TEXT_RECORDS 100
+#define MAX_MODIFICATION_RECORDS 100
+
+typedef struct {
+    char name[7];
+    int startAddress;
+    int programLength;
+} ProgramHeader;
+
 typedef struct {
     char opcode[3];
     int address;
-} OpcodeEntry;
+} Instruction;
 
-void processObjectFile(const char *filename, int relocationAddress, int isSICXE) {
+typedef struct {
+    int startAddress;
+    int length;
+    char objectCode[61];
+} TextRecord;
+
+typedef struct {
+    int address;
+    int length;
+    char flag;
+    char symbol[7];
+} ModificationRecord;
+
+ProgramHeader header;
+TextRecord textRecords[MAX_TEXT_RECORDS];
+ModificationRecord modRecords[MAX_MODIFICATION_RECORDS];
+int textCount, modCount, execAddress;
+
+void parseObjectFile(const char *filename, ProgramHeader *header,
+                     TextRecord *textRecords, ModificationRecord *modRecords, int *textCount, int *modCount, int *execAddress) {
     FILE *file = fopen(filename, "r");
     if (!file) {
         perror("Error opening file");
-        return;
+        exit(1);
     }
 
-    OpcodeEntry opcodes[100];
-    int opcodeCount = 0;
-
     char line[256];
+    *textCount = 0;
+    *modCount = 0;
+    *execAddress = -1;
+
     while (fgets(line, sizeof(line), file)) {
-        if (line[0] == 'T') {
-            // Parse Text (T) record
-            int startAddr, length;
-            sscanf(line + 1, "%06x%02x", &startAddr, &length);
+        line[strcspn(line, "\n")] = '\0';
 
-            for (int i = 0; i < length * 2; i += 6) {
-                OpcodeEntry entry;
-                strncpy(entry.opcode, line + 9 + i, 2); // Extract 2-char opcode
-                entry.opcode[2] = '\0';                // Null-terminate opcode
-
-                char addressStr[5];
-                strncpy(addressStr, line + 11 + i, 4); // Extract 4-char address
-                addressStr[4] = '\0';
-                entry.address = (int)strtol(addressStr, NULL, 16);
-
-                opcodes[opcodeCount++] = entry;
+        switch (line[0]) {
+            case 'H': {
+                // Parse header record
+                sscanf(line, "H%6s%06x%06x", header->name, &header->startAddress, &header->programLength);
+                break;
             }
-        } else if (line[0] == 'M') {
-            // Parse Modification (M) record
-            int modAddress, modLength;
-            sscanf(line + 1, "%06x%02x", &modAddress, &modLength);
-
-            // Apply modification
-            for (int i = 0; i < opcodeCount; i++) {
-                if (opcodes[i].address == modAddress) {
-                    // Adjust the address with relocation
-                    opcodes[i].address += relocationAddress;
-                    break;
-                }
+            case 'T': {
+                // Parse text record
+                TextRecord *current = &textRecords[(*textCount)++];
+                sscanf(line, "T%06x%2x%60s", &current->startAddress, &current->length, current->objectCode);
+                break;
             }
+            case 'M': {
+                // Parse modification record
+                ModificationRecord *current = &modRecords[(*modCount)++];
+                sscanf(line, "M%06x%02x%c%6s", &current->address, &current->length, &current->flag, current->symbol);
+                break;
+            }
+            case 'E': {
+                // Parse end record
+                sscanf(line, "E%06x", execAddress);
+                break;
+            }
+            default:
+                fprintf(stderr, "Unknown record type: %c\n", line[0]);
+                exit(1);
         }
     }
 
     fclose(file);
-
-    // Print the modified opcode dictionary
-    printf("Relocated Opcodes:\n");
-    for (int i = 0; i < opcodeCount; i++) {
-        printf("Opcode: %s, Address: %04X\n", opcodes[i].opcode, opcodes[i].address);
-    }
-    // // print T records
-    // for (int i = 0; i < opcodeCount; i++) {
-    //     // accumulate the the object code until it reaches 60 characters
-    //     char objectCode[61] = "";
-    //     int objectCodeLength = 0;
-    //     while (objectCodeLength < 60 && i < opcodeCount) {
-    //         char objectCodePart[7];
-    //         sprintf(objectCodePart, "%s%04X", opcodes[i].opcode, opcodes[i].address);
-    //         if (objectCodeLength + strlen(objectCodePart) <= 60) {
-    //             strcat(objectCode, objectCodePart);
-    //             objectCodeLength += strlen(objectCodePart);
-    //             i++;
-    //         } else {
-    //             break;
-    //         }
-    //     }
-    //     // print T record
-    //     printf("T%06X%02X%s\n", opcodes[i - 1].address, objectCodeLength / 2, objectCode);
-    // }
-    // // print E record
-    // printf("E%06X\n", relocationAddress);
 }
+
+// Function to apply modifications to the object code
+void applyModificationRecords(ProgramHeader *header, TextRecord *textRecords, int textCount,
+                              ModificationRecord *modRecords, int modCount, int relocationAddress) {
+
+    printf("Applying Modifications...\n\n");
+
+    for (int i = 0; i < modCount; i++) {
+        ModificationRecord *mod = &modRecords[i];
+        int adjustedAddress = mod->address + header->startAddress;
+
+        // Locate the text record containing this address
+        for (int j = 0; j < textCount; j++) {
+            TextRecord *record = &textRecords[j];
+
+            // Check if adjustedAddress falls within the range of this record
+            if (adjustedAddress >= record->startAddress &&
+                adjustedAddress < record->startAddress + record->length) {
+
+                int offset = adjustedAddress - record->startAddress;
+                int hexOffset = offset + 1;
+
+                // Ensure hexOffset is within bounds
+                int lengthInBytes = (mod->length + 1) / 2;
+
+
+                char newObjectCode[1024] = {0};
+
+
+                strncpy(newObjectCode, record->objectCode, hexOffset);
+
+                newObjectCode[hexOffset] = '\0';
+
+                char valueHex[9] = {0};
+                strncpy(valueHex, &record->objectCode[hexOffset], lengthInBytes * 2);
+                valueHex[lengthInBytes * 2] = '\0';
+
+
+                int value = (int)strtol(valueHex, NULL, 16);
+                if (mod->flag == '+') {
+                    value += relocationAddress;
+                } else if (mod->flag == '-') {
+                    value -= relocationAddress;
+                }
+
+                snprintf(&newObjectCode[hexOffset], lengthInBytes * 2 + 1, "%0*X", lengthInBytes * 2, value);
+
+                strcat(newObjectCode, &record->objectCode[hexOffset + lengthInBytes * 2]);
+
+                strncpy(record->objectCode, newObjectCode, sizeof(record->objectCode) - 1);
+                record->objectCode[sizeof(record->objectCode) - 1] = '\0';  // Ensure null termination
+
+                // Print the modification
+                printf("Processing Modification Record: %06X%02X%c%s\n", mod->address, mod->length, mod->flag, mod->symbol);
+                printf("Modifying value: %s\n", valueHex);
+                printf("Modified value: %.*s\n\n", lengthInBytes * 2, &record->objectCode[hexOffset]);
+
+                break;  // Exit once modification is applied
+                }
+        }
+
+    }
+
+    printf("\nModified Object Code:\n");
+    // Print header record
+    printf("H%-6s%06X%06X\n", header->name, header->startAddress + relocationAddress, header->programLength);
+    // Print modified text records
+    for (int i = 0; i < textCount; i++) {
+        TextRecord *record = &textRecords[i];
+        printf("T%06X%02X%s\n", record->startAddress + relocationAddress, record->length, record->objectCode);
+    }
+
+    // Print end record
+    printf("E%06X\n", execAddress + relocationAddress);
+
+    printf("=================================================================================================================\n");
+}
+
+void printRelocatedObjectFile() {
+
+}
+
+void printOriginalObjectFile() {
+
+    printf("=================================================================================================================\n");
+    printf("Original Object Code:\n\n");
+    printf("Header:\n");
+    printf("Program Name: %s\n", header.name);
+    printf("Start Address: %06X\n", header.startAddress);
+    printf("Program Length: %06X Bytes (Hex)\n", header.programLength);
+
+    printf("\nText Records:\n");
+    for (int i = 0; i < textCount; i++) {
+        printf("Start Address: %06X, Length: %02X, Object Code: %s\n",
+               textRecords[i].startAddress, textRecords[i].length, textRecords[i].objectCode);
+    }
+
+    printf("\nModification Records:\n");
+    for (int i = 0; i < modCount; i++) {
+        printf("Starting Address: %06X, Length (Half-bytes): %02X, Flag: %c, Symbol: %s\n",
+               modRecords[i].address, modRecords[i].length, modRecords[i].flag, modRecords[i].symbol);
+    }
+
+    printf("\nEnd Record:\n");
+    printf("E%06X\n\n", execAddress);
+
+    printf("=================================================================================================================\n");
+}
+
+void processObjectFile(const char *filename, int relocationAddress, int isSICXE) {
+
+    parseObjectFile(filename, &header, textRecords, modRecords, &textCount, &modCount, &execAddress);
+
+    printOriginalObjectFile();
+
+    applyModificationRecords(&header, textRecords, textCount, modRecords, modCount, relocationAddress);
+
+    printRelocatedObjectFile();
+
+}
+
+
 
 int main(int argc, char *argv[]) {
     if (argc != 4) {
